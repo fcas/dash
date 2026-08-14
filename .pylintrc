@@ -17,7 +17,8 @@ ignore-patterns=
 # The regex matches against paths.
 ignore-paths=^dash/dcc/.*$,
              ^dash/html/.*$,
-             ^dash/dash_table/.*$
+             ^dash/dash_table/.*$,
+             ^.*/node_modules/.*$
 
 # Python code to execute, usually for sys.path manipulation such as
 # pygtk.require().
@@ -75,6 +76,7 @@ disable=fixme,
         unnecessary-lambda-assignment,
         broad-exception-raised,
         consider-using-generator,
+        too-many-ancestors
 
 
 # Enable the message, report, category or checker with the given id(s). You can
@@ -414,7 +416,7 @@ max-bool-expr=5
 max-branches=15
 
 # Maximum number of locals for function / method body
-max-locals=20
+max-locals=25
 
 # Maximum number of parents for a class (see R0901).
 max-parents=7
@@ -429,7 +431,7 @@ max-returns=6
 max-statements=50
 
 # Minimum number of public methods for a class (see R0903).
-min-public-methods=2
+min-public-methods=1
 
 
 [IMPORTS]

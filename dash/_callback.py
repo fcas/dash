@@ -1,22 +1,30 @@
 import collections
 import hashlib
+import inspect
+import warnings
 from functools import wraps
+from typing import Callable, Optional, Any, List, Tuple, Union, Dict, TypeVar, cast
 
-import flask
+from typing_extensions import ParamSpec
 
 from .dependencies import (
     handle_callback_args,
     handle_grouped_callback_args,
     Output,
+    ClientsideFunction,
+    Input,
 )
+from .development.base_component import ComponentRegistry
 from .exceptions import (
     InvalidCallbackReturnValue,
     PreventUpdate,
     WildcardInLongCallback,
     MissingLongCallbackManagerError,
-    LongCallbackError,
+    BackgroundCallbackError,
+    ImportedInsideCallbackError,
 )
-
+from ._get_app import get_app
+from . import _callback_signing
 from ._grouping import (
     flatten_grouping,
     make_grouping_by_index,
@@ -31,44 +39,61 @@ from ._utils import (
     clean_property_name,
 )
 
-from . import _validate
-from .long_callback.managers import BaseLongCallbackManager
+from .background_callback.managers import BaseBackgroundCallbackManager
 from ._callback_context import context_value
+from .types import CallbackExecutionResponse
+from ._no_update import NoUpdate
+from . import _validate
+
+
+async def _async_invoke_callback(
+    func, *args, **kwargs
+):  # used to mark the frame for the debugger
+    # Check if the function is a coroutine function
+    if inspect.iscoroutinefunction(func):
+        return await func(*args, **kwargs)  # %% callback invoked %%
+    # If the function is not a coroutine, call it directly
+    return func(*args, **kwargs)  # %% callback invoked %%
 
 
 def _invoke_callback(func, *args, **kwargs):  # used to mark the frame for the debugger
     return func(*args, **kwargs)  # %% callback invoked %%
 
 
-class NoUpdate:
-    def to_plotly_json(self):  # pylint: disable=no-self-use
-        return {"_dash_no_update": "_dash_no_update"}
-
-    @staticmethod
-    def is_no_update(obj):
-        return isinstance(obj, NoUpdate) or (
-            isinstance(obj, dict) and obj == {"_dash_no_update": "_dash_no_update"}
-        )
+GLOBAL_CALLBACK_LIST: List[Any] = []
+GLOBAL_CALLBACK_MAP: Dict[str, Any] = {}
+GLOBAL_INLINE_SCRIPTS: List[Any] = []
+GLOBAL_API_PATHS: Dict[str, Any] = {}
 
 
-GLOBAL_CALLBACK_LIST = []
-GLOBAL_CALLBACK_MAP = {}
-GLOBAL_INLINE_SCRIPTS = []
+Params = ParamSpec("Params")
+ReturnVar = TypeVar("ReturnVar")
 
 
-# pylint: disable=too-many-locals
+# pylint: disable=too-many-locals,too-many-arguments
 def callback(
     *_args,
-    background=False,
-    interval=1000,
-    progress=None,
-    progress_default=None,
-    running=None,
-    cancel=None,
-    manager=None,
-    cache_args_to_ignore=None,
+    background: bool = False,
+    interval: int = 1000,
+    progress: Optional[Union[List[Output], Output]] = None,
+    progress_default: Any = None,
+    running: Optional[List[Tuple[Output, Any, Any]]] = None,
+    cancel: Optional[Union[List[Input], Input]] = None,
+    manager: Optional[BaseBackgroundCallbackManager] = None,
+    cache_args_to_ignore: Optional[list] = None,
+    cache_ignore_triggered=True,
+    on_error: Optional[Callable[[Exception], Any]] = None,
+    api_endpoint: Optional[str] = None,
+    optional: Optional[bool] = False,
+    hidden: Optional[bool] = None,
+    websocket: Optional[bool] = False,
+    persistent: Optional[bool] = False,
+    mcp_enabled: Optional[bool] = None,
+    mcp_expose_docstring: Optional[bool] = None,
+    compress_payload: bool = False,
+    compress_threshold: int = 5_000,
     **_kwargs,
-):
+) -> Callable[[Callable[Params, ReturnVar]], Callable[Params, ReturnVar]]:
     """
     Normally used as a decorator, `@dash.callback` provides a server-side
     callback relating the values of one or more `Output` items to one or
@@ -88,11 +113,11 @@ def callback(
 
     :Keyword Arguments:
         :param background:
-            Mark the callback as a long callback to execute in a manager for
+            Mark the callback as a background callback to execute in a manager for
             callbacks that take a long time without locking up the Dash app
             or timing out.
         :param manager:
-            A long callback manager instance. Currently, an instance of one of
+            A background callback manager instance. Currently, an instance of one of
             `DiskcacheManager` or `CeleryManager`.
             Defaults to the `background_callback_manager` instance provided to the
             `dash.Dash constructor`.
@@ -115,6 +140,7 @@ def callback(
             while a callback is running, the callback is canceled.
             Note that the value of the property is not significant, any change in
             value will result in the cancellation of the running job (if any).
+            This parameter only applies to background callbacks (`background=True`).
         :param progress:
             An `Output` dependency grouping that references properties of
             components in the app's layout. When provided, the decorated function
@@ -123,23 +149,59 @@ def callback(
             function should call in order to provide updates to the app on its
             current progress. This function accepts a single argument, which
             correspond to the grouping of properties specified in the provided
-            `Output` dependency grouping
+            `Output` dependency grouping. This parameter only applies to background
+            callbacks (`background=True`).
         :param progress_default:
             A grouping of values that should be assigned to the components
             specified by the `progress` argument when the callback is not in
             progress. If `progress_default` is not provided, all the dependency
             properties specified in `progress` will be set to `None` when the
-            callback is not running.
+            callback is not running. This parameter only applies to background
+            callbacks (`background=True`).
         :param cache_args_to_ignore:
             Arguments to ignore when caching is enabled. If callback is configured
             with keyword arguments (Input/State provided in a dict),
             this should be a list of argument names as strings. Otherwise,
             this should be a list of argument indices as integers.
+            This parameter only applies to background callbacks (`background=True`).
+        :param cache_ignore_triggered:
+            Whether to ignore which inputs triggered the callback when creating
+            the cache. This parameter only applies to background callbacks
+            (`background=True`).
         :param interval:
-            Time to wait between the long callback update requests.
+            Time to wait between the background callback update requests.
+        :param on_error:
+            Function to call when the callback raises an exception. Receives the
+            exception object as first argument. The callback_context can be used
+            to access the original callback inputs, states and output.
+        :param optional:
+            Mark all dependencies as not required on the initial layout checks.
+        :param hidden:
+            Hide the callback from the devtools callbacks tab.
+        :param api_endpoint:
+            If provided, the callback will be available at the given API endpoint.
+            This allows you to call the callback directly through HTTP requests
+            instead of through the Dash front-end. The endpoint should be a string
+            that starts with a forward slash (e.g. `/my_callback`).
+            The endpoint is relative to the Dash app's base URL.
+            Note that the endpoint will not appear in the list of registered
+            callbacks in the Dash devtools.
+        :param persistent:
+            If True, this callback will not show the "Updating..." title while
+            running. Useful for persistent WebSocket callbacks that stay active
+            for long periods without requiring a loading indicator.
+        :param compress_payload:
+            If True, the callback request payload will be compressed using gzip
+            compression before being sent to the server. This can significantly
+            reduce network transmission size for large payloads.
+            Defaults to False.
+        :param compress_threshold:
+            The size threshold in bytes above which the payload will be compressed
+            when `compress_payload` is True. Set to 0 to always compress regardless
+            of size. Defaults to 5,000 bytes (5 kB).
     """
 
-    long_spec = None
+    background_spec: Any = None
 
     config_prevent_initial_callbacks = _kwargs.pop(
         "config_prevent_initial_callbacks", False
@@ -148,59 +210,80 @@ def callback(
     callback_list = _kwargs.pop("callback_list", GLOBAL_CALLBACK_LIST)
 
     if background:
-        long_spec = {
+        background_spec = {
             "interval": interval,
         }
 
         if manager:
-            long_spec["manager"] = manager
+            background_spec["manager"] = manager
 
         if progress:
-            long_spec["progress"] = coerce_to_list(progress)
-            validate_long_inputs(long_spec["progress"])
+            background_spec["progress"] = coerce_to_list(progress)
+            validate_background_inputs(background_spec["progress"])
 
         if progress_default:
-            long_spec["progressDefault"] = coerce_to_list(progress_default)
+            background_spec["progressDefault"] = coerce_to_list(progress_default)
 
-            if not len(long_spec["progress"]) == len(long_spec["progressDefault"]):
+            if not len(background_spec["progress"]) == len(
+                background_spec["progressDefault"]
+            ):
                 raise Exception(
                     "Progress and progress default needs to be of same length"
                 )
 
         if cancel:
             cancel_inputs = coerce_to_list(cancel)
-            validate_long_inputs(cancel_inputs)
+            validate_background_inputs(cancel_inputs)
 
-            long_spec["cancel"] = [c.to_dict() for c in cancel_inputs]
-            long_spec["cancel_inputs"] = cancel_inputs
+            background_spec["cancel"] = [c.to_dict() for c in cancel_inputs]
+            background_spec["cancel_inputs"] = cancel_inputs
 
         if cache_args_to_ignore:
-            long_spec["cache_args_to_ignore"] = cache_args_to_ignore
+            background_spec["cache_args_to_ignore"] = cache_args_to_ignore
 
-    return register_callback(
+        background_spec["cache_ignore_triggered"] = cache_ignore_triggered
+
+    raw = register_callback(
         callback_list,
         callback_map,
         config_prevent_initial_callbacks,
         *_args,
         **_kwargs,
-        long=long_spec,
+        background=background_spec,
         manager=manager,
         running=running,
+        on_error=on_error,
+        api_endpoint=api_endpoint,
+        optional=optional,
+        hidden=hidden,
+        websocket=websocket,
+        persistent=persistent,
+        mcp_enabled=mcp_enabled,
+        mcp_expose_docstring=mcp_expose_docstring,
+        compress_payload=compress_payload,
+        compress_threshold=compress_threshold,
+    )
+
+    return cast(
+        Callable[[Callable[Params, ReturnVar]], Callable[Params, ReturnVar]], raw
     )
 
 
-def validate_long_inputs(deps):
+def validate_background_inputs(deps):
     for dep in deps:
         if dep.has_wildcard():
             raise WildcardInLongCallback(
                 f"""
-                long callbacks does not support dependencies with
+                background callbacks does not support dependencies with
                 pattern-matching ids
                     Received: {repr(dep)}\n"""
             )
 
 
-def clientside_callback(clientside_function, *args, **kwargs):
+ClientsideFuncType = Union[str, ClientsideFunction]
+
+
+def clientside_callback(clientside_function: ClientsideFuncType, *args, **kwargs):
     return register_clientside_callback(
         GLOBAL_CALLBACK_LIST,
         GLOBAL_CALLBACK_MAP,
@@ -223,12 +306,20 @@ def insert_callback(
     state,
     inputs_state_indices,
     prevent_initial_call,
-    long=None,
+    background=None,
     manager=None,
     running=None,
-    dynamic_creator=False,
+    dynamic_creator: Optional[bool] = False,
     no_output=False,
-):
+    optional=False,
+    hidden=None,
+    websocket=False,
+    persistent=False,
+    mcp_enabled=None,
+    mcp_expose_docstring=None,
+    compress_payload: bool = False,
+    compress_threshold: int = 5_000,
+) -> str:
     if prevent_initial_call is None:
         prevent_initial_call = config_prevent_initial_callbacks
 
@@ -245,12 +336,18 @@ def insert_callback(
         # prevent_initial_call can be a string "initial_duplicates"
         # which should not prevent the initial call.
         "prevent_initial_call": prevent_initial_call is True,
-        "long": long
+        "background": background
         and {
-            "interval": long["interval"],
+            "interval": background["interval"],
         },
         "dynamic_creator": dynamic_creator,
         "no_output": no_output,
+        "optional": optional,
+        "hidden": hidden,
+        "websocket": websocket,
+        "persistent": persistent,
+        "compress_payload": compress_payload,
+        "compress_threshold": compress_threshold,
     }
     if running:
         callback_spec["running"] = running
@@ -260,21 +357,387 @@ def insert_callback(
         "state": callback_spec["state"],
         "outputs_indices": outputs_indices,
         "inputs_state_indices": inputs_state_indices,
-        "long": long,
+        "background": background,
         "output": output,
         "raw_inputs": inputs,
         "manager": manager,
         "allow_dynamic_callbacks": dynamic_creator,
         "no_output": no_output,
+        "websocket": websocket,
+        "mcp_enabled": mcp_enabled,
+        "mcp_expose_docstring": mcp_expose_docstring,
+        "compress_payload": compress_payload,
+        "compress_threshold": compress_threshold,
     }
     callback_list.append(callback_spec)
 
     return callback_id
 
 
-# pylint: disable=R0912, R0915
-def register_callback(  # pylint: disable=R0914
-    callback_list, callback_map, config_prevent_initial_callbacks, *_args, **_kwargs
+def _set_side_update(ctx, response) -> bool:
+    side_update = dict(ctx.updated_props)
+    if len(side_update) > 0:
+        response["sideUpdate"] = side_update
+        return True
+    return False
+
+
+def _initialize_context(args, kwargs, inputs_state_indices, has_output, insert_output):
+    """Initialize context and validate output specifications."""
+    app = kwargs.pop("app", None)
+    output_spec = kwargs.pop("outputs_list")
+    callback_ctx = kwargs.pop("callback_context", AttributeDict({"updated_props": {}}))
+    context_value.set(callback_ctx)
+    original_packages = set(ComponentRegistry.registry)
+
+    if has_output:
+        _validate.validate_output_spec(insert_output, output_spec, Output)
+
+    func_args, func_kwargs = _validate.validate_and_group_input_args(
+        args, inputs_state_indices
+    )
+    return (
+        output_spec,
+        callback_ctx,
+        func_args,
+        func_kwargs,
+        app,
+        original_packages,
+        False,
+    )
+
+
+def get_request_end_id(secret: bytes):
+    """Return the verified end_id for the current request, or ``None``.
+
+    The renderer echoes the server-signed ``endId`` token on every callback
+    request; this verifies the signature and returns the underlying end_id so
+    background handles can be checked against it.
+    """
+    adapter = get_app().backend.request_adapter()
+    if not adapter:
+        return None
+    token = adapter.args.get("endId")
+    return _callback_signing.unsign(secret, _callback_signing.END_SCOPE, token)
+
+
+def _get_signing_secret() -> bytes:
+    return get_app()._get_signing_secret()  # pylint: disable=protected-access
+
+
+def _get_callback_manager(
+    kwargs: dict, background: dict
+) -> BaseBackgroundCallbackManager:
+    """Set up the background callback and manage jobs."""
+    callback_manager = background.get(
+        "manager", kwargs.get("background_callback_manager", None)
+    )
+    if background is not None:
+        if not callback_manager:
+            raise MissingLongCallbackManagerError(
+                "Running `background` callbacks requires a manager to be installed.\n"
+                "Available managers:\n"
+                "- Diskcache (`pip install dash[diskcache]`) to run callbacks in a separate Process"
+                " and store results on the local filesystem.\n"
+                "- Celery (`pip install dash[celery]`) to run callbacks in a celery worker"
+                " and store results on redis.\n"
+            )
+
+    adapter = get_app().backend.request_adapter()
+    old_job = adapter.args.getlist("oldJob") if hasattr(adapter.args, "getlist") else []
+
+    if old_job:
+        secret = _get_signing_secret()
+        scope = _callback_signing.job_scope(get_request_end_id(secret))
+        for signed_job in old_job:
+            # Only terminate jobs whose handle we actually signed for this page
+            # load; ignore forged or replayed pids.
+            job = _callback_signing.unsign(secret, scope, signed_job)
+            if job is not None:
+                callback_manager.terminate_job(job)
+
+    return callback_manager
+
+
+def _setup_background_callback(
+    kwargs, background, background_key, func, func_args, func_kwargs, callback_ctx
+):
+    """Set up the background callback and manage jobs."""
+    callback_manager = _get_callback_manager(kwargs, background)
+    if not callback_manager:
+        return to_json({"error": "No background callback manager configured"})
+
+    progress_outputs = background.get("progress")
+
+    cache_ignore_triggered = background.get("cache_ignore_triggered", True)
+
+    cache_key = callback_manager.build_cache_key(
+        func,
+        func_args if func_args else func_kwargs,
+        background.get("cache_args_to_ignore", []),
+        None if cache_ignore_triggered else callback_ctx.get("triggered_inputs", []),
+    )
+    job_fn = callback_manager.func_registry.get(background_key)
+    ctx_value = AttributeDict(**context_value.get())
+    ctx_value.ignore_register_page = True
+    ctx_value.pop("background_callback_manager")
+    ctx_value.pop("dash_response")
+
+    args_value = ctx_value.get("args")
+    if args_value is not None and not isinstance(args_value, dict):
+        ctx_value["args"] = dict(args_value)
+
+    job = callback_manager.call_job_fn(
+        cache_key,
+        job_fn,
+        func_args if func_args else func_kwargs,
+        ctx_value,
+    )
+
+    # Sign the handles before handing them to the browser so they cannot be
+    # forged (arbitrary pid kill / arbitrary cache read) or replayed from
+    # another page load. The renderer treats them as opaque strings.
+    secret = _get_signing_secret()
+    end_id = get_request_end_id(secret)
+    data = {
+        "cacheKey": _callback_signing.sign(
+            secret, _callback_signing.cache_scope(end_id), cache_key
+        ),
+        "job": _callback_signing.sign(
+            secret, _callback_signing.job_scope(end_id), str(job)
+        ),
+    }
+
+    cancel = background.get("cancel")
+    if cancel:
+        data["cancel"] = cancel
+
+    progress_default = background.get("progressDefault")
+    if progress_default:
+        data["progressDefault"] = {
+            str(o): x for o, x in zip(progress_outputs, progress_default)
+        }
+    return to_json(data)
+
+
+def _read_request_handles():
+    """Read and verify the signed cacheKey/job handles from the current request.
+
+    Returns ``(cache_key, job_id)`` as the raw (unsigned) values, or ``None`` for
+    any handle that is missing or whose signature does not verify against this
+    page load's end_id. This is what prevents a client from supplying an
+    arbitrary cache key (read/delete) or an arbitrary pid (kill).
+    """
+    adapter = get_app().backend.request_adapter()
+    if not adapter:
+        return None, None
+    secret = _get_signing_secret()
+    end_id = get_request_end_id(secret)
+    cache_key = _callback_signing.unsign(
+        secret,
+        _callback_signing.cache_scope(end_id),
+        adapter.args.get("cacheKey"),
+    )
+    job_id = _callback_signing.unsign(
+        secret,
+        _callback_signing.job_scope(end_id),
+        adapter.args.get("job"),
+    )
+    return cache_key, job_id
+
+
+def _progress_background_callback(
+    response, callback_manager, background, cache_key=None
+):
+    progress_outputs = background.get("progress")
+
+    if progress_outputs and cache_key is not None:
+        # Get the progress before the result as it would be erased after the results.
+        progress = callback_manager.get_progress(cache_key)
+        if progress:
+            response["progress"] = {
+                str(x): progress[i] for i, x in enumerate(progress_outputs)
+            }
+
+
+def _update_background_callback(
+    error_handler,
+    callback_ctx,
+    response,
+    kwargs,
+    background,
+    multi,
+    cache_key=None,
+    job_id=None,
+):
+    """Set up the background callback and manage jobs."""
+    callback_manager = _get_callback_manager(kwargs, background)
+
+    if cache_key is None or job_id is None:
+        req_cache_key, req_job_id = _read_request_handles()
+        cache_key = cache_key or req_cache_key
+        job_id = job_id or req_job_id
+
+    _progress_background_callback(
+        response, callback_manager, background, cache_key=cache_key
+    )
+
+    if cache_key is None:
+        # No valid handle for this page load -> read nothing, delete nothing.
+        output_value = callback_manager.UNDEFINED
+    else:
+        output_value = callback_manager.get_result(cache_key, job_id)
+
+    return _handle_rest_background_callback(
+        output_value,
+        callback_manager,
+        response,
+        error_handler,
+        callback_ctx,
+        multi,
+        cache_key=cache_key,
+        job_id=job_id,
+    )
+
+
+def _handle_rest_background_callback(
+    output_value,
+    callback_manager,
+    response,
+    error_handler,
+    callback_ctx,
+    multi,
+    has_update=False,
+    cache_key=None,
+    job_id=None,
+):
+    # Must get job_running after get_result since get_results terminates it.
+    job_running = callback_manager.job_running(job_id) if job_id is not None else False
+    if not job_running and output_value is callback_manager.UNDEFINED:
+        # Job canceled -> no output to close the loop.
+        output_value = NoUpdate()
+
+    elif isinstance(output_value, dict) and "background_callback_error" in output_value:
+        error = output_value.get("background_callback_error", {})
+        exc = BackgroundCallbackError(
+            f"An error occurred inside a background callback: {error['msg']}\n{error['tb']}"
+        )
+        if error_handler:
+            output_value = error_handler(exc)
+
+            if output_value is None:
+                output_value = NoUpdate()
+            # set_props from the error handler uses the original ctx
+            # instead of manager.get_updated_props since it runs in the
+            # request process.
+            has_update = (
+                _set_side_update(callback_ctx, response) or output_value is not None
+            )
+        else:
+            raise exc
+
+    if job_running and output_value is not callback_manager.UNDEFINED:
+        # cached results.
+        callback_manager.terminate_job(job_id)
+
+    if multi and isinstance(output_value, (list, tuple)):
+        output_value = [
+            NoUpdate() if NoUpdate.is_no_update(r) else r for r in output_value
+        ]
+    updated_props = callback_manager.get_updated_props(cache_key)
+    if len(updated_props) > 0:
+        response["sideUpdate"] = updated_props
+        has_update = True
+
+    if output_value is callback_manager.UNDEFINED:
+        return to_json(response), has_update, True
+    return output_value, has_update, False
+
+
+# pylint: disable=too-many-branches
+def _prepare_response(
+    output_value,
+    output_spec,
+    multi,
+    response: CallbackExecutionResponse,
+    callback_ctx,
+    app,
+    original_packages,
+    background,
+    has_update,
+    has_output,
+    output,
+    callback_id,
+    allow_dynamic_callbacks,
+):
+    """Prepare the response object based on the callback output."""
+    component_ids: dict = collections.defaultdict(dict)
+
+    if has_output:
+        if not multi:
+            output_value, output_spec = [output_value], [output_spec]
+            flat_output_values = output_value
+        else:
+            if isinstance(output_value, (list, tuple)):
+                # For multi-output, allow top-level collection to be
+                # list or tuple
+                output_value = list(output_value)
+            if NoUpdate.is_no_update(output_value):
+                flat_output_values = [output_value]
+            else:
+                # Flatten grouping and validate grouping structure
+                flat_output_values = flatten_grouping(output_value, output)
+
+        if not NoUpdate.is_no_update(output_value):
+            _validate.validate_multi_return(
+                output_spec, flat_output_values, callback_id
+            )
+
+        for val, spec in zip(flat_output_values, output_spec):
+            if NoUpdate.is_no_update(val):
+                continue
+            for vali, speci in (
+                zip(val, spec) if isinstance(spec, list) else [[val, spec]]  # type: ignore[reportArgumentType]
+            ):
+                if not NoUpdate.is_no_update(vali):
+                    has_update = True
+                    id_str = stringify_id(speci["id"])
+                    prop = clean_property_name(speci["property"])
+                    component_ids[id_str][prop] = vali
+
+    else:
+        if output_value is not None:
+            raise InvalidCallbackReturnValue(
+                f"No-output callback received return value: {output_value}"
+            )
+
+    if not background:
+        has_update = _set_side_update(callback_ctx, response) or has_output
+
+    if not has_update:
+        raise PreventUpdate
+
+    if len(ComponentRegistry.registry) != len(original_packages):
+        diff_packages = list(
+            set(ComponentRegistry.registry).difference(original_packages)
+        )
+        if not allow_dynamic_callbacks:
+            raise ImportedInsideCallbackError(
+                f"Component librar{'y' if len(diff_packages) == 1 else 'ies'} was imported during callback.\n"
+                "You can set `_allow_dynamic_callbacks` to allow for development purpose only."
+            )
+        dist = app.get_dist(diff_packages)
+        response["dist"] = dist
+    return response.update({"response": component_ids})
+
+
+# pylint: disable=too-many-branches,too-many-statements
+def register_callback(
+    callback_list,
+    callback_map,
+    config_prevent_initial_callbacks,
+    *_args,
+    **_kwargs,
 ):
     (
         output,
@@ -294,9 +757,10 @@ def register_callback(  # pylint: disable=R0914
         multi = True
         has_output = len(output) > 0
 
-    long = _kwargs.get("long")
+    background = _kwargs.get("background")
     manager = _kwargs.get("manager")
     running = _kwargs.get("running")
+    on_error = _kwargs.get("on_error")
     if running is not None:
         if not isinstance(running[0], (list, tuple)):
             running = [running]
@@ -317,205 +781,101 @@ def register_callback(  # pylint: disable=R0914
         flat_state,
         inputs_state_indices,
         prevent_initial_call,
-        long=long,
+        background=background,
         manager=manager,
         dynamic_creator=allow_dynamic_callbacks,
         running=running,
         no_output=not has_output,
+        optional=_kwargs.get("optional", False),
+        hidden=_kwargs.get("hidden", None),
+        websocket=_kwargs.get("websocket", False),
+        persistent=_kwargs.get("persistent", False),
+        mcp_enabled=_kwargs.get("mcp_enabled", None),
+        mcp_expose_docstring=_kwargs.get("mcp_expose_docstring"),
+        compress_payload=_kwargs.get("compress_payload", False),
+        compress_threshold=_kwargs.get("compress_threshold", 5_000),
     )
 
     # pylint: disable=too-many-locals
     def wrap_func(func):
+        if _kwargs.get("api_endpoint"):
+            api_endpoint = _kwargs.get("api_endpoint")
+            GLOBAL_API_PATHS[api_endpoint] = func
 
-        if long is not None:
-            long_key = BaseLongCallbackManager.register_func(
+        if background is None:
+            background_key = None
+        else:
+            background_key = BaseBackgroundCallbackManager.register_func(
                 func,
-                long.get("progress") is not None,
+                background.get("progress") is not None,
                 callback_id,
             )
 
         @wraps(func)
         def add_context(*args, **kwargs):
-            output_spec = kwargs.pop("outputs_list")
-            app_callback_manager = kwargs.pop("long_callback_manager", None)
-            callback_ctx = kwargs.pop(
-                "callback_context", AttributeDict({"updated_props": {}})
+            """Handles synchronous callbacks with context management."""
+            error_handler = on_error or kwargs.pop("app_on_error", None)
+
+            (
+                output_spec,
+                callback_ctx,
+                func_args,
+                func_kwargs,
+                app,
+                original_packages,
+                has_update,
+            ) = _initialize_context(
+                args, kwargs, inputs_state_indices, has_output, insert_output
             )
-            callback_manager = long and long.get("manager", app_callback_manager)
-            if has_output:
-                _validate.validate_output_spec(insert_output, output_spec, Output)
 
-            context_value.set(callback_ctx)
+            response: CallbackExecutionResponse = {"multi": True}
+            jsonResponse: Optional[str] = None
+            try:
+                if background is not None:
+                    adapter = get_app().backend.request_adapter()
+                    if not (adapter and adapter.args.get("cacheKey")):
+                        return _setup_background_callback(
+                            kwargs,
+                            background,
+                            background_key,
+                            func,
+                            func_args,
+                            func_kwargs,
+                            callback_ctx,
+                        )
 
-            func_args, func_kwargs = _validate.validate_and_group_input_args(
-                args, inputs_state_indices
-            )
-
-            response = {"multi": True}
-            has_update = False
-
-            if long is not None:
-                if not callback_manager:
-                    raise MissingLongCallbackManagerError(
-                        "Running `long` callbacks requires a manager to be installed.\n"
-                        "Available managers:\n"
-                        "- Diskcache (`pip install dash[diskcache]`) to run callbacks in a separate Process"
-                        " and store results on the local filesystem.\n"
-                        "- Celery (`pip install dash[celery]`) to run callbacks in a celery worker"
-                        " and store results on redis.\n"
+                    output_value, has_update, skip = _update_background_callback(
+                        error_handler, callback_ctx, response, kwargs, background, multi
                     )
-
-                progress_outputs = long.get("progress")
-                cache_key = flask.request.args.get("cacheKey")
-                job_id = flask.request.args.get("job")
-                old_job = flask.request.args.getlist("oldJob")
-
-                current_key = callback_manager.build_cache_key(
-                    func,
-                    # Inputs provided as dict is kwargs.
-                    func_args if func_args else func_kwargs,
-                    long.get("cache_args_to_ignore", []),
-                )
-
-                if old_job:
-                    for job in old_job:
-                        callback_manager.terminate_job(job)
-
-                if not cache_key:
-                    cache_key = current_key
-
-                    job_fn = callback_manager.func_registry.get(long_key)
-
-                    job = callback_manager.call_job_fn(
-                        cache_key,
-                        job_fn,
-                        func_args if func_args else func_kwargs,
-                        AttributeDict(
-                            args_grouping=callback_ctx.args_grouping,
-                            using_args_grouping=callback_ctx.using_args_grouping,
-                            outputs_grouping=callback_ctx.outputs_grouping,
-                            using_outputs_grouping=callback_ctx.using_outputs_grouping,
-                            inputs_list=callback_ctx.inputs_list,
-                            states_list=callback_ctx.states_list,
-                            outputs_list=callback_ctx.outputs_list,
-                            input_values=callback_ctx.input_values,
-                            state_values=callback_ctx.state_values,
-                            triggered_inputs=callback_ctx.triggered_inputs,
-                            ignore_register_page=True,
-                        ),
-                    )
-
-                    data = {
-                        "cacheKey": cache_key,
-                        "job": job,
-                    }
-
-                    cancel = long.get("cancel")
-                    if cancel:
-                        data["cancel"] = cancel
-
-                    progress_default = long.get("progressDefault")
-                    if progress_default:
-                        data["progressDefault"] = {
-                            str(o): x
-                            for o, x in zip(progress_outputs, progress_default)
-                        }
-                    return to_json(data)
-                if progress_outputs:
-                    # Get the progress before the result as it would be erased after the results.
-                    progress = callback_manager.get_progress(cache_key)
-                    if progress:
-                        response["progress"] = {
-                            str(x): progress[i] for i, x in enumerate(progress_outputs)
-                        }
-
-                output_value = callback_manager.get_result(cache_key, job_id)
-                # Must get job_running after get_result since get_results terminates it.
-                job_running = callback_manager.job_running(job_id)
-                if not job_running and output_value is callback_manager.UNDEFINED:
-                    # Job canceled -> no output to close the loop.
-                    output_value = NoUpdate()
-
-                elif (
-                    isinstance(output_value, dict)
-                    and "long_callback_error" in output_value
-                ):
-                    error = output_value.get("long_callback_error")
-                    raise LongCallbackError(
-                        f"An error occurred inside a long callback: {error['msg']}\n{error['tb']}"
-                    )
-
-                if job_running and output_value is not callback_manager.UNDEFINED:
-                    # cached results.
-                    callback_manager.terminate_job(job_id)
-
-                if multi and isinstance(output_value, (list, tuple)):
-                    output_value = [
-                        NoUpdate() if NoUpdate.is_no_update(r) else r
-                        for r in output_value
-                    ]
-                updated_props = callback_manager.get_updated_props(cache_key)
-                if len(updated_props) > 0:
-                    response["sideUpdate"] = updated_props
-                    has_update = True
-
-                if output_value is callback_manager.UNDEFINED:
-                    return to_json(response)
-            else:
-                output_value = _invoke_callback(func, *func_args, **func_kwargs)
-
-            if NoUpdate.is_no_update(output_value):
-                raise PreventUpdate
-
-            component_ids = collections.defaultdict(dict)
-
-            if has_output:
-                if not multi:
-                    output_value, output_spec = [output_value], [output_spec]
-                    flat_output_values = output_value
+                    if skip:
+                        return output_value
                 else:
-                    if isinstance(output_value, (list, tuple)):
-                        # For multi-output, allow top-level collection to be
-                        # list or tuple
-                        output_value = list(output_value)
+                    output_value = _invoke_callback(func, *func_args, **func_kwargs)  # type: ignore[reportArgumentType]
+            except PreventUpdate:
+                raise
+            except Exception as err:  # pylint: disable=broad-exception-caught
+                if error_handler:
+                    output_value = error_handler(err)
+                    if output_value is None and output_spec:
+                        output_value = NoUpdate()
+                else:
+                    raise err
 
-                    # Flatten grouping and validate grouping structure
-                    flat_output_values = flatten_grouping(output_value, output)
-
-                _validate.validate_multi_return(
-                    output_spec, flat_output_values, callback_id
-                )
-
-                for val, spec in zip(flat_output_values, output_spec):
-                    if isinstance(val, NoUpdate):
-                        continue
-                    for vali, speci in (
-                        zip(val, spec) if isinstance(spec, list) else [[val, spec]]
-                    ):
-                        if not isinstance(vali, NoUpdate):
-                            has_update = True
-                            id_str = stringify_id(speci["id"])
-                            prop = clean_property_name(speci["property"])
-                            component_ids[id_str][prop] = vali
-            else:
-                if output_value is not None:
-                    raise InvalidCallbackReturnValue(
-                        f"No-output callback received return value: {output_value}"
-                    )
-                output_value = []
-                flat_output_values = []
-
-            if not long:
-                side_update = dict(callback_ctx.updated_props)
-                if len(side_update) > 0:
-                    has_update = True
-                    response["sideUpdate"] = side_update
-
-            if not has_update:
-                raise PreventUpdate
-
-            response["response"] = component_ids
-
+            _prepare_response(
+                output_value,
+                output_spec,
+                multi,
+                response,
+                callback_ctx,
+                app,
+                original_packages,
+                background,
+                has_update,
+                has_output,
+                output,
+                callback_id,
+                allow_dynamic_callbacks,
+            )
             try:
                 jsonResponse = to_json(response)
             except TypeError:
@@ -523,7 +883,96 @@ def register_callback(  # pylint: disable=R0914
 
             return jsonResponse
 
-        callback_map[callback_id]["callback"] = add_context
+        @wraps(func)
+        async def async_add_context(*args, **kwargs):
+            """Handles async callbacks with context management."""
+            error_handler = on_error or kwargs.pop("app_on_error", None)
+
+            (
+                output_spec,
+                callback_ctx,
+                func_args,
+                func_kwargs,
+                app,
+                original_packages,
+                has_update,
+            ) = _initialize_context(
+                args, kwargs, inputs_state_indices, has_output, insert_output
+            )
+
+            response: CallbackExecutionResponse = {"multi": True}
+
+            try:
+                if background is not None:
+                    adapter = get_app().backend.request_adapter()
+                    if not (adapter and adapter.args.get("cacheKey")):
+                        return _setup_background_callback(
+                            kwargs,
+                            background,
+                            background_key,
+                            func,
+                            func_args,
+                            func_kwargs,
+                            callback_ctx,
+                        )
+                    output_value, has_update, skip = _update_background_callback(
+                        error_handler, callback_ctx, response, kwargs, background, multi
+                    )
+                    if skip:
+                        return output_value
+                else:
+                    output_value = await _async_invoke_callback(
+                        func, *func_args, **func_kwargs
+                    )
+            except PreventUpdate:
+                raise
+            except Exception as err:  # pylint: disable=broad-exception-caught
+                if error_handler:
+                    output_value = error_handler(err)
+                    if output_value is None and output_spec:
+                        output_value = NoUpdate()
+                else:
+                    raise err
+
+            _prepare_response(
+                output_value,
+                output_spec,
+                multi,
+                response,
+                callback_ctx,
+                app,
+                original_packages,
+                background,
+                has_update,
+                has_output,
+                output,
+                callback_id,
+                allow_dynamic_callbacks,
+            )
+            try:
+                jsonResponse = to_json(response)
+            except TypeError:
+                _validate.fail_callback_output(output_value, output)
+
+            return jsonResponse
+
+        if inspect.iscoroutinefunction(func):
+            callback_map[callback_id]["callback"] = async_add_context
+        else:
+            # A persistent, no-output callback streams via set_props and typically
+            # runs for the life of the connection. When synchronous it occupies a
+            # WebSocket worker thread the whole time and can exhaust the pool, so
+            # warn that it should be async (async callbacks run on the event loop).
+            if _kwargs.get("persistent") and not has_output:
+                warnings.warn(
+                    f"persistent=True callback '{callback_id}' is synchronous and "
+                    "has no Output; it will occupy a WebSocket worker thread for the "
+                    "life of the connection and can exhaust the pool. Define it with "
+                    "'async def' so it runs on the event loop instead.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            callback_map[callback_id]["callback"] = add_context
 
         return func
 
@@ -544,11 +993,12 @@ def register_clientside_callback(
     callback_map,
     config_prevent_initial_callbacks,
     inline_scripts,
-    clientside_function,
+    clientside_function: ClientsideFuncType,
     *args,
     **kwargs,
 ):
     output, inputs, state, prevent_initial_call = handle_callback_args(args, kwargs)
+    no_output = isinstance(output, (list,)) and len(output) == 0
     insert_callback(
         callback_list,
         callback_map,
@@ -559,6 +1009,8 @@ def register_clientside_callback(
         state,
         None,
         prevent_initial_call,
+        no_output=no_output,
+        hidden=kwargs.get("hidden", None),
     )
 
     # If JS source is explicitly given, create a namespace and function

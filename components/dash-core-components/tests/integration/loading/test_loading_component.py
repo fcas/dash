@@ -1,5 +1,6 @@
 from multiprocessing import Lock
-from dash import Dash, Input, Output, dcc, html
+from dash import Dash, Input, Output, dcc, html, MATCH, ALL
+from dash.dependencies import stringify_id
 from dash.testing import wait
 import time
 
@@ -10,7 +11,8 @@ def test_ldcp001_loading_component_initialization(dash_dcc):
     app = Dash(__name__)
 
     app.layout = html.Div(
-        [dcc.Loading([html.Div(id="div-1")], className="loading")], id="root"
+        [dcc.Loading([html.Div(id="div-1")], id="loading", className="loading")],
+        id="root",
     )
 
     @app.callback(Output("div-1", "children"), [Input("root", "n_clicks")])
@@ -20,7 +22,7 @@ def test_ldcp001_loading_component_initialization(dash_dcc):
 
     with lock:
         dash_dcc.start_server(app)
-        dash_dcc.find_element(".loading .dash-spinner")
+        dash_dcc.find_element("#loading .loading .dash-spinner")
         # ensure inner component is also mounted
         dash_dcc.wait_for_text_to_equal("#div-1", "")
 
@@ -413,9 +415,9 @@ def test_ldcp009_loading_component_overlay_style(dash_dcc):
     assert dash_dcc.get_logs() == []
 
 
-# multiple components, only one triggers the spinner
+# update multiple props of same component, only targeted id/prop triggers spinner
+# test that target_components id can be a dict id
 def test_ldcp010_loading_component_target_components(dash_dcc):
-
     lock = Lock()
 
     app = Dash(__name__)
@@ -424,52 +426,60 @@ def test_ldcp010_loading_component_target_components(dash_dcc):
         [
             dcc.Loading(
                 [
-                    html.Button(id="btn-1"),
+                    html.Button(id={"type": "button", "index": "one"}),
                     html.Button(id="btn-2"),
+                    html.Button(id="btn-3"),
                 ],
                 className="loading-1",
-                target_components={"btn-2": "children"},
+                target_components={
+                    stringify_id({"type": "button", "index": "one"}): "className"
+                },
             )
         ],
         id="root",
     )
 
-    @app.callback(Output("btn-1", "children"), [Input("btn-2", "n_clicks")])
+    @app.callback(
+        Output({"type": "button", "index": "one"}, "children"),
+        [Input("btn-2", "n_clicks")],
+    )
     def updateDiv1(n_clicks):
         if n_clicks:
             with lock:
                 return "changed 1"
-
         return "content 1"
 
-    @app.callback(Output("btn-2", "children"), [Input("btn-1", "n_clicks")])
+    @app.callback(
+        Output({"type": "button", "index": "one"}, "className"),
+        [Input("btn-3", "n_clicks")],
+    )
     def updateDiv2(n_clicks):
         if n_clicks:
             with lock:
-                return "changed 2"
-
-        return "content 2"
+                return "new-class"
+        return ""
 
     dash_dcc.start_server(app)
 
-    dash_dcc.wait_for_text_to_equal("#btn-1", "content 1")
-    dash_dcc.wait_for_text_to_equal("#btn-2", "content 2")
+    btn1id = "[id='" + stringify_id({"type": "button", "index": "one"}) + "']"
 
-    with lock:
-        dash_dcc.find_element("#btn-1").click()
-
-        dash_dcc.find_element(".loading-1 .dash-spinner")
-        dash_dcc.wait_for_text_to_equal("#btn-2", "")
-
-    dash_dcc.wait_for_text_to_equal("#btn-2", "changed 2")
+    dash_dcc.wait_for_text_to_equal(btn1id, "content 1")
 
     with lock:
         dash_dcc.find_element("#btn-2").click()
-        spinners = dash_dcc.find_elements(".loading-1 .dash-spinner")
-        dash_dcc.wait_for_text_to_equal("#btn-1", "")
 
-    dash_dcc.wait_for_text_to_equal("#btn-1", "changed 1")
+        spinners = dash_dcc.find_elements(".loading-1 .dash-spinner")
+        dash_dcc.wait_for_text_to_equal(btn1id, "")
+    dash_dcc.wait_for_text_to_equal(btn1id, "changed 1")
     assert spinners == []
+
+    with lock:
+        dash_dcc.find_element("#btn-3").click()
+
+        dash_dcc.find_element(".loading-1 .dash-spinner")
+        dash_dcc.wait_for_text_to_equal(btn1id, "")
+
+    dash_dcc.wait_for_class_to_equal(btn1id, "new-class")
 
     assert dash_dcc.get_logs() == []
 
@@ -686,5 +696,193 @@ def test_ldcp016_loading_component_delay_hide(dash_dcc):
     time.sleep(0.2)
     dash_dcc.find_element(".loading .dash-spinner")
     dash_dcc.wait_for_text_to_equal("#div-1", "changed")
+
+    assert dash_dcc.get_logs() == []
+
+
+# multiple components, only one triggers the spinner
+def test_ldcp017_loading_component_target_components_duplicates(dash_dcc):
+
+    lock = Lock()
+
+    app = Dash(__name__)
+
+    app.layout = html.Div(
+        [
+            dcc.Loading(
+                [
+                    html.Button(id="btn-1"),
+                    html.Button(id="btn-2", children="content 2"),
+                ],
+                className="loading-1",
+                target_components={"btn-2": "children"},
+                debug=True,
+            )
+        ],
+        id="root",
+    )
+
+    @app.callback(Output("btn-1", "children"), [Input("btn-2", "n_clicks")])
+    def updateDiv1(n_clicks):
+        if n_clicks:
+            with lock:
+                return "changed 1"
+
+        return "content 1"
+
+    @app.callback(
+        Output("btn-2", "children", allow_duplicate=True),
+        [Input("btn-1", "n_clicks")],
+        prevent_initial_call=True,
+    )
+    def updateDiv2(n_clicks):
+        if n_clicks:
+            with lock:
+                return "changed 2"
+
+        return "content 2"
+
+    dash_dcc.start_server(app)
+
+    dash_dcc.wait_for_text_to_equal("#btn-1", "content 1")
+    dash_dcc.wait_for_text_to_equal("#btn-2", "content 2")
+
+    with lock:
+        dash_dcc.find_element("#btn-1").click()
+
+        dash_dcc.find_element(".loading-1 .dash-spinner")
+        dash_dcc.wait_for_text_to_equal("#btn-2", "")
+
+    dash_dcc.wait_for_text_to_equal("#btn-2", "changed 2")
+
+    with lock:
+        dash_dcc.find_element("#btn-2").click()
+        spinners = dash_dcc.find_elements(".loading-1 .dash-spinner")
+        dash_dcc.wait_for_text_to_equal("#btn-1", "")
+
+    dash_dcc.wait_for_text_to_equal("#btn-1", "changed 1")
+    assert spinners == []
+
+    assert dash_dcc.get_logs() == []
+
+
+# target_components with "*" wildcard - matches all props
+def test_ldcp018_loading_component_target_components_wildcard(dash_dcc):
+    lock = Lock()
+
+    app = Dash(__name__)
+
+    app.layout = html.Div(
+        [
+            dcc.Loading(
+                [
+                    html.Button("1", id="btn-1"),
+                    html.Button("2", id="btn-2"),
+                    html.Button("3", id="btn-3"),
+                ],
+                className="loading-1",
+                target_components={"btn-2": "*"},
+            )
+        ],
+        id="root",
+    )
+
+    @app.callback(Output("btn-2", "children"), [Input("btn-1", "n_clicks")])
+    def update_btn2_children(n_clicks):
+        if n_clicks:
+            with lock:
+                return "changed children"
+        return "content 2"
+
+    @app.callback(Output("btn-2", "className"), [Input("btn-3", "n_clicks")])
+    def update_btn2_class(n_clicks):
+        if n_clicks:
+            with lock:
+                return "changed-class"
+        return "original-class"
+
+    @app.callback(Output("btn-1", "children"), [Input("btn-2", "n_clicks")])
+    def update_btn1_children(n_clicks):
+        if n_clicks:
+            with lock:
+                return "changed 1"
+        return "content 1"
+
+    dash_dcc.start_server(app)
+
+    dash_dcc.wait_for_text_to_equal("#btn-1", "content 1")
+    dash_dcc.wait_for_text_to_equal("#btn-2", "content 2")
+
+    # Test that updating btn-2 children triggers spinner (wildcard matches)
+    with lock:
+        dash_dcc.find_element("#btn-1").click()
+        dash_dcc.wait_for_element(".loading-1 .dash-spinner")
+        dash_dcc.wait_for_text_to_equal("#btn-2", "")
+
+    dash_dcc.wait_for_text_to_equal("#btn-2", "changed children")
+
+    # Test that updating btn-2 className also triggers spinner (wildcard matches)
+    with lock:
+        dash_dcc.find_element("#btn-3").click()
+        dash_dcc.wait_for_element(".loading-1 .dash-spinner")
+
+    # Verify className was updated
+    dash_dcc.wait_for_class_to_equal("#btn-2", "changed-class")
+
+    # Test that updating btn-1 does NOT trigger spinner (not targeted)
+    with lock:
+        dash_dcc.find_element("#btn-2").click()
+        spinners = dash_dcc.find_elements(".loading-1 .dash-spinner")
+        dash_dcc.wait_for_text_to_equal("#btn-1", "")
+
+    dash_dcc.wait_for_text_to_equal("#btn-1", "changed 1")
+    assert spinners == []
+
+    assert dash_dcc.get_logs() == []
+
+
+# loading spinner triggers when callback Output uses ALL wildcard
+def test_ldcp019_loading_component_pattern_matching(dash_dcc):
+    lock = Lock()
+
+    app = Dash(__name__)
+
+    app.layout = html.Div(
+        [
+            dcc.Loading(
+                [
+                    html.Div(
+                        id={"type": "div-1", "index": 1, "name": "test"},
+                        className="div-1",
+                    )
+                ],
+                className="loading",
+            )
+        ],
+        id={"type": "root", "index": 1, "name": "test"},
+        className="root",
+    )
+
+    @app.callback(
+        Output({"type": "div-1", "index": ALL, "name": MATCH}, "children"),
+        Input({"type": "root", "index": ALL, "name": MATCH}, "n_clicks"),
+    )
+    def updateDiv(n_clicks):
+        if n_clicks == [1]:
+            time.sleep(0.1)
+            return ["changed"]
+        return ["content"]
+
+    with lock:
+        dash_dcc.start_server(app)
+        dash_dcc.wait_for_text_to_equal(".div-1", "content")
+
+        dash_dcc.find_element(".root").click()
+
+        dash_dcc.find_element(".loading .dash-spinner")
+        # mounted but hidden, so looks like no text
+        dash_dcc.wait_for_text_to_equal(".div-1", "")
+
+    dash_dcc.wait_for_text_to_equal(".div-1", "changed")
 
     assert dash_dcc.get_logs() == []

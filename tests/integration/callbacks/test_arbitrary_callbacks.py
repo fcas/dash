@@ -1,7 +1,17 @@
 import time
 from multiprocessing import Value
 
-from dash import Dash, Input, Output, html, set_props, register_page
+from flaky import flaky
+
+from dash import (
+    Dash,
+    Input,
+    Output,
+    html,
+    set_props,
+    register_page,
+    clientside_callback,
+)
 
 
 def test_arb001_global_set_props(dash_duo):
@@ -81,7 +91,7 @@ def test_arb002_no_output_callbacks(dash_duo):
         assert counter.value == 1
 
 
-def test_arb003_arbitrary_pages(dash_duo):
+def test_arb003_arbitrary_pages(dash_duo, clear_pages_state):
     app = Dash(use_pages=True, pages_folder="")
 
     register_page(
@@ -188,3 +198,81 @@ def test_arb006_multi_set_props(dash_duo):
     dash_duo.wait_for_style_to_equal(
         "#output", "background-color", "rgba(255, 0, 0, 1)"
     )
+
+
+def test_arb007_clientside_no_output(dash_duo):
+    app = Dash()
+
+    app.layout = [
+        html.Button("start", id="start1"),
+        html.Button("start2", id="start2"),
+        html.Div(id="output"),
+    ]
+
+    clientside_callback(
+        """
+        function(_) {
+            dash_clientside.set_props('output', {children: 'start1'})
+        }
+        """,
+        Input("start1", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    clientside_callback(
+        """
+        function(_) {
+            dash_clientside.set_props('output', {children: 'start2'})
+        }
+        """,
+        Input("start2", "n_clicks"),
+        prevent_initial_call=True,
+    )
+
+    dash_duo.start_server(app)
+
+    dash_duo.find_element("#start1").click()
+    dash_duo.wait_for_text_to_equal("#output", "start1")
+    dash_duo.find_element("#start2").click()
+    dash_duo.wait_for_text_to_equal("#output", "start2")
+
+
+@flaky(max_runs=3)
+def test_arb008_set_props_chain_cb(dash_duo):
+    app = Dash(suppress_callback_exceptions=True)
+
+    app.layout = html.Div(
+        [
+            html.Button("origin button", id="origin-button"),
+            html.Div(id="generated-button-container"),
+            html.Div("initial text", id="generated-button-output"),
+        ],
+        style={"padding": 50},
+    )
+
+    @app.callback(
+        Input("origin-button", "n_clicks"),
+    )
+    def generate_button(n_clicks):
+        set_props(
+            "generated-button-container",
+            {
+                "children": html.Button(
+                    "generated button", id="generated-button", n_clicks=0
+                )
+            },
+        )
+
+    @app.callback(
+        Output("generated-button-output", "children"),
+        Input("generated-button", "n_clicks", allow_optional=True),
+        prevent_initial_call=True,
+    )
+    def update_output(n_clicks):
+        return f"n_clicks: {n_clicks}"
+
+    dash_duo.start_server(app)
+
+    dash_duo.wait_for_element("#origin-button").click()
+    for i in range(1, 5):
+        dash_duo.wait_for_element("#generated-button").click()
+        dash_duo.wait_for_text_to_equal("#generated-button-output", f"n_clicks: {i}")

@@ -25,6 +25,7 @@ import {
 } from '../types/callbacks';
 import {
     addAllResolvedFromOutputs,
+    getAnyVals,
     getUnfilteredLayoutCallbacks,
     idMatch,
     isMultiValued,
@@ -72,11 +73,18 @@ export function getCallbacksByInput(
         }
         patterns.forEach(pattern => {
             if (idMatch(_keys, vals, pattern.values)) {
+                // When a callback's Outputs have no MATCH keys, the
+                // triggering Input's MATCH values are what uniquify each
+                // firing's resolvedId (see addAllResolvedFromOutputs).
+                // Callbacks whose Outputs do carry MATCH keys ignore this
+                // value since the Output pattern drives resolution.
+                const triggerAnyVals = getAnyVals(pattern.values, vals);
                 pattern.callbacks.forEach(
                     addAllResolvedFromOutputs(
                         resolveDeps(_keys, vals, pattern.values),
                         paths,
-                        matches
+                        matches,
+                        triggerAnyVals
                     )
                 );
             }
@@ -233,13 +241,27 @@ export const getReadyCallbacks = (
         }
     }
 
+    // Ramda.JS `difference` function is slow because it compares objects entirely
+    // This cause the following `filter` to be exponentially slow as the number of inputs or outputs grow
+    // We can optimize this by comparing only the `id+prop` part of the inputs & outputs.
+    // Original difference takes 380ms on average to compute difference between 200 inputs and 1 output.
+    // The following function takes 1-2ms on average.
+    const differenceBasedOnId = (inputs: any[], outputs: any[]): any[] =>
+        inputs.filter(
+            input =>
+                !outputs.some(
+                    output =>
+                        combineIdAndProp(input) === combineIdAndProp(output)
+                )
+        );
+
     // Find `requested` callbacks that do not depend on a outstanding output (as either input or state)
     // Outputs which overlap an input do not count as an outstanding output
     return filter(
         cb =>
             all<ILayoutCallbackProperty>(
                 cbp => !outputsMap[combineIdAndProp(cbp)],
-                difference(
+                differenceBasedOnId(
                     flatten(cb.getInputs(paths)),
                     flatten(cb.getOutputs(paths))
                 )
@@ -330,12 +352,18 @@ export const getLayoutCallbacks = (
 
 export const getUniqueIdentifier = ({
     anyVals,
-    callback: {inputs, outputs, state}
-}: ICallback): string =>
-    concat(
-        map(combineIdAndProp, [...inputs, ...outputs, ...state]),
+    callback: {inputs, outputs, state, output}
+}: ICallback): string => {
+    const idParts = map(combineIdAndProp, [...inputs, ...outputs, ...state]);
+    // For no-output callbacks, include the output hash to ensure uniqueness
+    if (outputs.length === 0 && output) {
+        idParts.push(output);
+    }
+    return concat(
+        idParts,
         Array.isArray(anyVals) ? anyVals : anyVals === '' ? [] : [anyVals]
     ).join(',');
+};
 
 export function includeObservers(
     id: any,

@@ -3,6 +3,8 @@ import PropTypes from 'prop-types';
 import {FontAwesomeIcon} from '@fortawesome/react-fontawesome';
 import {faCopy, faCheckCircle} from '@fortawesome/free-regular-svg-icons';
 
+import LoadingElement from '../utils/LoadingElement';
+
 const clipboardAPI = navigator.clipboard;
 
 function wait(ms) {
@@ -14,6 +16,8 @@ function wait(ms) {
  */
 
 export default class Clipboard extends React.Component {
+    static contextType = window.dash_component_api.DashContext;
+
     constructor(props) {
         super(props);
         this.copyToClipboard = this.copyToClipboard.bind(this);
@@ -96,7 +100,7 @@ export default class Clipboard extends React.Component {
     }
 
     async loading() {
-        while (this.props.loading_state?.is_loading) {
+        while (this.context.isLoading()) {
             await wait(100);
         }
     }
@@ -124,24 +128,25 @@ export default class Clipboard extends React.Component {
     }
 
     render() {
-        const {id, title, className, style, loading_state} = this.props;
-        const copyIcon = <FontAwesomeIcon icon={faCopy} />;
-        const copiedIcon = <FontAwesomeIcon icon={faCheckCircle} />;
-        const btnIcon = this.state.copied ? copiedIcon : copyIcon;
+        const {id, title, className, style, children, copied_children} =
+            this.props;
+
+        const isCopied = this.state.copied;
+
+        const button_children = isCopied
+            ? copied_children ?? <FontAwesomeIcon icon={faCheckCircle} />
+            : children ?? <FontAwesomeIcon icon={faCopy} />;
 
         return clipboardAPI ? (
-            <div
+            <LoadingElement
                 id={id}
                 title={title}
                 style={style}
                 className={className}
                 onClick={this.onClickHandler}
-                data-dash-is-loading={
-                    (loading_state && loading_state.is_loading) || undefined
-                }
             >
-                <i> {btnIcon}</i>
-            </div>
+                {button_children}
+            </LoadingElement>
         ) : null;
     }
 }
@@ -160,6 +165,16 @@ Clipboard.propTypes = {
     id: PropTypes.string,
 
     /**
+     * Children rendered inside the Clipboard button before copying. By default, a copy icon.
+     */
+    children: PropTypes.node,
+
+    /**
+     * Children rendered inside the Clipboard button after the value has been copied. By default, a check icon.
+     */
+    copied_children: PropTypes.node,
+
+    /**
      * The id of target component containing text to copy to the clipboard.
      * The inner text of the `children` prop will be copied to the clipboard.  If none, then the text from the
      *  `value` prop will be copied.
@@ -172,7 +187,7 @@ Clipboard.propTypes = {
     content: PropTypes.string,
 
     /**
-     * The number of times copy button was clicked
+     * The number of times Clipboard button was clicked
      */
     n_clicks: PropTypes.number,
 
@@ -195,24 +210,6 @@ Clipboard.propTypes = {
      * The class  name of the icon element
      */
     className: PropTypes.string,
-
-    /**
-     * Object that holds the loading state object coming from dash-renderer
-     */
-    loading_state: PropTypes.shape({
-        /**
-         * Determines if the component is loading or not
-         */
-        is_loading: PropTypes.bool,
-        /**
-         * Holds which property is loading
-         */
-        prop_name: PropTypes.string,
-        /**
-         * Holds the name of the component that is loading
-         */
-        component_name: PropTypes.string,
-    }),
 
     /**
      * Dash-assigned callback that gets fired when the value changes.

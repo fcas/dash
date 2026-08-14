@@ -3,7 +3,9 @@ import shlex
 import sys
 import uuid
 import hashlib
-import collections
+import importlib
+import importlib.util
+from collections import abc
 import subprocess
 import logging
 import io
@@ -11,17 +13,20 @@ import json
 import secrets
 import string
 import inspect
+import re
+import os
+
 from html import escape
 from functools import wraps
-from typing import Union
-from dash.types import RendererHooks
+from typing import Optional, Union
+from .types import RendererHooks
 
 logger = logging.getLogger()
 
 
 def to_json(value):
     # pylint: disable=import-outside-toplevel
-    from plotly.io.json import to_json_plotly
+    from plotly.io.json import to_json_plotly  # type: ignore[import-untyped]
 
     return to_json_plotly(value)
 
@@ -56,7 +61,7 @@ def generate_hash():
 
 # pylint: disable=no-member
 def patch_collections_abc(member):
-    return getattr(collections.abc, member)
+    return getattr(abc, member)
 
 
 class AttributeDict(dict):
@@ -102,6 +107,11 @@ class AttributeDict(dict):
         else:
             object.__setattr__(self, "_read_only", new_read_only)
 
+    def unset_read_only(self, keys):
+        if hasattr(self, "_read_only"):
+            for key in keys:
+                self._read_only.pop(key, None)
+
     def finalize(self, msg="Object is final: No new keys may be added."):
         """Prevent any new keys being set."""
         object.__setattr__(self, "_final", msg)
@@ -116,9 +126,11 @@ class AttributeDict(dict):
 
         return super().__setitem__(key, val)
 
-    def update(self, other):
+    def update(self, other=None, **kwargs):
         # Overrides dict.update() to use __setitem__ above
-        for k, v in other.items():
+        # Needs default `None` and `kwargs` to satisfy type checking
+        source = other if other is not None else kwargs
+        for k, v in source.items():
             self[k] = v
 
     # pylint: disable=inconsistent-return-statements
@@ -154,6 +166,20 @@ def create_callback_id(output, inputs, no_output=False):
 
     if no_output:
         # No output will hash the inputs.
+        # For no-input callbacks, also include the call site to make each unique
+        if not inputs:
+            # Get the call site of the @callback decorator
+            stack = inspect.stack()
+            # Walk up the stack to find the actual callback call site
+            # Fallback to empty hash if no external frame found
+            # (skip internal dash package frames)
+            dash_package_path = os.path.dirname(__file__)
+            for frame_info in stack:
+                # Skip frames from within the dash package itself
+                if not frame_info.filename.startswith(dash_package_path):
+                    call_site = f"{frame_info.filename}:{frame_info.lineno}"
+                    return hashlib.sha256(call_site.encode("utf-8")).hexdigest()
+
         return _hash_inputs()
 
     if isinstance(output, (list, tuple)):
@@ -173,7 +199,7 @@ def split_callback_id(callback_id):
     return {"id": id_, "property": prop}
 
 
-def stringify_id(id_):
+def stringify_id(id_) -> str:
     def _json(k, v):
         vstr = v.to_json() if hasattr(v, "to_json") else json.dumps(v)
         return f"{json.dumps(k)}:{vstr}"
@@ -249,7 +275,7 @@ def gen_salt(chars):
     )
 
 
-class OrderedSet(collections.abc.MutableSet):
+class OrderedSet(abc.MutableSet):
     def __init__(self, *args):
         self._data = []
         for i in args:
@@ -302,3 +328,137 @@ def get_caller_name():
             return s.frame.f_locals.get("__name__", "__main__")
 
     return "__main__"
+
+
+def pascal_case(name: Union[str, None]):
+    s = re.sub(r"\s", "_", str(name))
+    # Replace leading `_`
+    s = re.sub("^[_]+", "", s)
+    if not s:
+        return s
+    return s[0].upper() + re.sub(
+        r"[\-_\.]+([a-z])", lambda match: match.group(1).upper(), s[1:]
+    )
+
+
+def get_root_path(import_name: str) -> str:
+    """Find the root path of a package, or the path that contains a
+    module. If it cannot be found, returns the current working
+    directory.
+
+    Not to be confused with the value returned by :func:`find_package`.
+
+    :meta private:
+    """
+    # Module already imported and has a file attribute. Use that first.
+    mod = sys.modules.get(import_name)
+
+    if mod is not None and hasattr(mod, "__file__") and mod.__file__ is not None:
+        return os.path.dirname(os.path.abspath(mod.__file__))
+
+    # Next attempt: check the loader.
+    try:
+        spec = importlib.util.find_spec(import_name)
+
+        if spec is None:
+            raise ValueError
+    except (ImportError, ValueError):
+        loader = None
+    else:
+        loader = spec.loader
+
+    # Loader does not exist or we're referring to an unloaded main
+    # module or a main module without path (interactive sessions), go
+    # with the current working directory.
+    if loader is None:
+        return os.getcwd()
+
+    if hasattr(loader, "get_filename"):
+        filepath = loader.get_filename(import_name)  # pyright: ignore
+    else:
+        # Fall back to imports.
+        __import__(import_name)
+        mod = sys.modules[import_name]
+        filepath = getattr(mod, "__file__", None)
+
+        # If we don't have a file path it might be because it is a
+        # namespace package. In this case pick the root path from the
+        # first module that is contained in the package.
+        if filepath is None:
+            raise RuntimeError(
+                "No root path can be found for the provided module"
+                f" {import_name!r}. This can happen because the module"
+                " came from an import hook that does not provide file"
+                " name information or because it's a namespace package."
+                " In this case the root path needs to be explicitly"
+                " provided."
+            )
+
+    # filepath is import_name.py for a module, or __init__.py for a package.
+    return os.path.dirname(os.path.abspath(filepath))  # type: ignore[no-any-return]
+
+
+def canonical_import_name(module_file: str) -> Optional[str]:
+    """Best-effort dotted import name for a running main module.
+
+    Mirrors how the FastAPI backend derives the uvicorn import string
+    (see ``dash/backends/_fastapi.py``): the path relative to the current
+    working directory with the separator replaced by dots, so a nested
+    ``package/app.py`` is aliased under ``package.app`` rather than just
+    ``app``. Falls back to the bare basename when the file lives outside the
+    cwd (e.g. ``python some/dir/app.py`` where only the script's own directory
+    is on ``sys.path``).
+
+    :meta private:
+    """
+    try:
+        rel_path = os.path.relpath(os.path.abspath(module_file), os.getcwd())
+    except (ValueError, OSError):
+        rel_path = os.path.basename(module_file)
+    if rel_path == os.pardir or rel_path.startswith(os.pardir + os.sep):
+        rel_path = os.path.basename(module_file)
+    parts = os.path.splitext(rel_path)[0].split(os.sep)
+    if not all(part.isidentifier() for part in parts):
+        return None
+    return ".".join(parts)
+
+
+def alias_main_module(caller_name: str) -> None:
+    """Pre-register the running main module under its canonical import name.
+
+    When the app module runs as a script (``__main__``), or is re-executed by
+    multiprocessing's spawn as ``__mp_main__`` (e.g. in the worker process of
+    uvicorn's reloader), a later import of the same file by its real name
+    ("app:server" import strings) would execute the module a second time,
+    registering every callback twice. Pre-registering the running module under
+    its canonical import name makes that import resolve to this module instead
+    of re-executing the file. See issue #3818.
+
+    :meta private:
+    """
+    if caller_name not in ("__main__", "__mp_main__"):
+        return
+    module = sys.modules.get(caller_name)
+    if module is None:
+        return
+    module_file = getattr(module, "__file__", None)
+    if not module_file:
+        return
+    import_name = canonical_import_name(module_file)
+    if import_name is None or import_name in sys.modules:
+        return
+    try:
+        spec = importlib.util.find_spec(import_name)
+        if (
+            spec is not None
+            and spec.origin is not None
+            and os.path.samefile(spec.origin, module_file)
+        ):
+            sys.modules[import_name] = module
+    except (ImportError, ValueError, OSError):
+        # Aliasing is a best-effort optimization to avoid re-executing the
+        # module: find_spec may raise ImportError/ValueError if the name isn't
+        # importable (e.g. a namespace package or a parent __init__ that errors)
+        # and samefile may raise OSError if spec.origin no longer exists. In any
+        # of these cases we simply skip the alias and let the normal import run.
+        pass

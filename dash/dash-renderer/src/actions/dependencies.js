@@ -5,6 +5,7 @@ import {
     any,
     ap,
     assoc,
+    concat,
     difference,
     equals,
     evolve,
@@ -36,6 +37,7 @@ import {
     resolveDeps
 } from './dependencies_ts';
 import {computePaths, getPath} from './paths';
+import {isCarriedOverByPatch, wasWrittenByPatch} from './patchAnalysis';
 
 import {crawlLayout} from './utils';
 
@@ -162,24 +164,50 @@ function addMap(depMap, id, prop, dependency) {
     callbacks.push(dependency);
 }
 
-function addPattern(depMap, idSpec, prop, dependency) {
+// Patterns are stored in a nested Map structure to avoid the overhead of
+// stringifying ids for every callback.
+function addPattern(patterns, idSpec, prop, dependency) {
     const keys = Object.keys(idSpec).sort();
     const keyStr = keys.join(',');
     const values = props(keys, idSpec);
-    const keyCallbacks = (depMap[keyStr] = depMap[keyStr] || {});
-    const propCallbacks = (keyCallbacks[prop] = keyCallbacks[prop] || []);
-    let valMatch = false;
-    for (let i = 0; i < propCallbacks.length; i++) {
-        if (equals(values, propCallbacks[i].values)) {
-            valMatch = propCallbacks[i];
-            break;
-        }
+    const valuesKey = values
+        .map(v =>
+            typeof v === 'object' && v !== null
+                ? v.wild
+                    ? v.wild
+                    : JSON.stringify(v)
+                : String(v)
+        )
+        .join('|');
+
+    if (!patterns.has(keyStr)) {
+        patterns.set(keyStr, new Map());
     }
+    const propMap = patterns.get(keyStr);
+    if (!propMap.has(prop)) {
+        propMap.set(prop, new Map());
+    }
+    const valueMap = propMap.get(prop);
+
+    let valMatch = valueMap.get(valuesKey);
     if (!valMatch) {
         valMatch = {keys, values, callbacks: []};
-        propCallbacks.push(valMatch);
+        valueMap.set(valuesKey, valMatch);
     }
     valMatch.callbacks.push(dependency);
+}
+
+// Convert the nested Map structure of patterns into the plain nested object structure
+// expected by the rest of the code, with stringified id keys.
+// This is only done once per pattern, at the end of graph construction,
+// to minimize the overhead of stringifying ids.
+function offloadPatterns(patternsMap, targetMap) {
+    for (const [keyStr, propMap] of patternsMap.entries()) {
+        targetMap[keyStr] = {};
+        for (const [prop, valueMap] of propMap.entries()) {
+            targetMap[keyStr][prop] = Array.from(valueMap.values());
+        }
+    }
 }
 
 function validateDependencies(parsedDependencies, dispatchError) {
@@ -197,14 +225,17 @@ function validateDependencies(parsedDependencies, dispatchError) {
             'In the callback for output(s):\n  ' +
             outputs.map(combineIdAndProp).join('\n  ');
 
-        if (!inputs.length) {
+        if (!inputs.length && dep.prevent_initial_call) {
             dispatchError('A callback is missing Inputs', [
                 head,
                 'there are no `Input` elements.',
                 'Without `Input` elements, it will never get called.',
                 '',
                 'Subscribing to `Input` components will cause the',
-                'callback to be called whenever their values change.'
+                'callback to be called whenever their values change.',
+                '',
+                'If you want a callback without inputs that fires on initial load,',
+                'set prevent_initial_call=False.'
             ]);
         }
 
@@ -407,24 +438,37 @@ function findMismatchedWildcards(outputs, inputs, state, head, dispatchError) {
             ]);
         }
     });
+    // When the Outputs don't carry any MATCH keys (fixed-id outputs, no
+    // outputs, or wildcard outputs with only ALL), the Inputs/State may use
+    // MATCH freely — each firing is identified by the triggering input's
+    // MATCH values. ALLSMALLER still requires a MATCH reference, so that
+    // case remains an error. See issue #2462.
+    const outputsHaveMatch = out0MatchKeys.length > 0;
     [
         [inputs, 'Input'],
         [state, 'State']
     ].forEach(([args, cls]) => {
         args.forEach((arg, i) => {
             const {matchKeys, allsmallerKeys} = findWildcardKeys(arg.id);
-            const allWildcardKeys = matchKeys.concat(allsmallerKeys);
-            const diff = difference(allWildcardKeys, out0MatchKeys);
+            const diffKeys = outputsHaveMatch
+                ? matchKeys.concat(allsmallerKeys)
+                : allsmallerKeys;
+            const diff = difference(diffKeys, out0MatchKeys);
             if (diff.length) {
                 diff.sort();
+                const outDesc = outputs.length
+                    ? `Output 0 (${combineIdAndProp(outputs[0])})`
+                    : 'the (absent) Output';
                 dispatchError('`Input` / `State` wildcards not in `Output`s', [
                     head,
                     `${cls} ${i} (${combineIdAndProp(arg)})`,
                     `has MATCH or ALLSMALLER on key(s) ${diff.join(', ')}`,
-                    `where Output 0 (${combineIdAndProp(outputs[0])})`,
+                    `where ${outDesc}`,
                     'does not have a MATCH wildcard. Inputs and State do not',
-                    'need every MATCH from the Output(s), but they cannot have',
-                    'extras beyond the Output(s).'
+                    'need every MATCH from the Output(s), but ALLSMALLER',
+                    'requires a matching MATCH in the Output(s), and when',
+                    'the Output(s) have any MATCH, Input/State MATCH keys',
+                    'must be a subset of them.'
                 ]);
             }
         });
@@ -568,10 +612,26 @@ export function validateCallbacksToLayout(state_, dispatchError) {
     function validateMap(map, cls, doState) {
         for (const id in map) {
             const idProps = map[id];
+            const fcb = flatten(values(idProps));
+            const optional = fcb.reduce((acc, cb) => {
+                if (acc === false || cb.optional) {
+                    return acc;
+                }
+                const deps = concat(cb.outputs, cb.inputs, cb.states).filter(
+                    dep => dep.id === id
+                );
+                return (
+                    !deps.length ||
+                    all(({allow_optional}) => allow_optional, deps)
+                );
+            }, true);
+            if (optional) {
+                continue;
+            }
             const idPath = getPath(paths, id);
             if (!idPath) {
                 if (validateIds) {
-                    missingId(id, cls, flatten(values(idProps)));
+                    missingId(id, cls, fcb);
                 }
             } else {
                 for (const property in idProps) {
@@ -609,9 +669,10 @@ export function validateCallbacksToLayout(state_, dispatchError) {
     validatePatterns(inputPatterns, 'Input');
 }
 
-export function computeGraphs(dependencies, dispatchError) {
+export function computeGraphs(dependencies, dispatchError, config) {
     // multiGraph is just for finding circular deps
     const multiGraph = new DepGraph();
+    const start = performance.now();
 
     const wildcardPlaceholders = {};
 
@@ -640,7 +701,9 @@ export function computeGraphs(dependencies, dispatchError) {
         hasError = true;
         dispatchError(message, lines);
     };
-    validateDependencies(parsedDependencies, wrappedDE);
+    if (config.validate_callbacks) {
+        validateDependencies(parsedDependencies, wrappedDE);
+    }
 
     /*
      * For regular ids, outputMap and inputMap are:
@@ -666,8 +729,10 @@ export function computeGraphs(dependencies, dispatchError) {
      */
     const outputMap = {};
     const inputMap = {};
-    const outputPatterns = {};
-    const inputPatterns = {};
+    const outputPatternMap = new Map();
+    const inputPatternMap = new Map();
+    let outputPatterns = {};
+    let inputPatterns = {};
 
     const finalGraphs = {
         MultiGraph: multiGraph,
@@ -684,12 +749,14 @@ export function computeGraphs(dependencies, dispatchError) {
         return finalGraphs;
     }
 
+    // builds up wildcardPlaceholders with all the wildcard keys and values used in the callbacks, so we can generate the full list of ids that each callback depends on.
     parsedDependencies.forEach(dependency => {
         const {outputs, inputs} = dependency;
 
-        outputs.concat(inputs).forEach(item => {
-            const {id} = item;
-            if (typeof id === 'object') {
+        outputs
+            .concat(inputs)
+            .filter(item => typeof item.id === 'object')
+            .forEach(item => {
                 forEachObjIndexed((val, key) => {
                     if (!wildcardPlaceholders[key]) {
                         wildcardPlaceholders[key] = {
@@ -705,11 +772,11 @@ export function computeGraphs(dependencies, dispatchError) {
                     } else if (keyPlaceholders.exact.indexOf(val) === -1) {
                         keyPlaceholders.exact.push(val);
                     }
-                }, id);
-            }
-        });
+                }, item.id);
+            });
     });
 
+    // Efficiently build wildcardPlaceholders.vals arrays
     forEachObjIndexed(keyPlaceholders => {
         const {exact, expand} = keyPlaceholders;
         const vals = exact.slice().sort(idValSort);
@@ -791,6 +858,7 @@ export function computeGraphs(dependencies, dispatchError) {
     const cbOut = [];
 
     function addInputToMulti(inIdProp, outIdProp, firstPass = true) {
+        if (!config.validate_callbacks) return;
         multiGraph.addNode(inIdProp);
         multiGraph.addDependency(inIdProp, outIdProp);
         // only store callback inputs and outputs during the first pass
@@ -808,6 +876,7 @@ export function computeGraphs(dependencies, dispatchError) {
         cbOut.push([]);
 
         function addOutputToMulti(outIdFinal, outIdProp) {
+            if (!config.validate_callbacks) return;
             multiGraph.addNode(outIdProp);
             inputs.forEach(inObj => {
                 const {id: inId, property} = inObj;
@@ -842,28 +911,35 @@ export function computeGraphs(dependencies, dispatchError) {
         outputs.forEach(outIdProp => {
             const {id: outId, property} = outIdProp;
             // check if this output is also an input to the same callback
-            const alsoInput = checkInOutOverlap(outIdProp, inputs);
+            let alsoInput;
+            if (config.validate_callbacks) {
+                alsoInput = checkInOutOverlap(outIdProp, inputs);
+            }
             if (typeof outId === 'object') {
-                const outIdList = makeAllIds(outId, {});
-                outIdList.forEach(id => {
-                    const tempOutIdProp = {id, property};
-                    let outIdName = combineIdAndProp(tempOutIdProp);
+                if (config.validate_callbacks) {
+                    const outIdList = makeAllIds(outId, {});
+                    outIdList.forEach(id => {
+                        const tempOutIdProp = {id, property};
+                        let outIdName = combineIdAndProp(tempOutIdProp);
+                        // if this output is also an input, add `outputTag` to the name
+                        if (alsoInput) {
+                            duplicateOutputs.push(tempOutIdProp);
+                            outIdName += outputTag;
+                        }
+                        addOutputToMulti(id, outIdName);
+                    });
+                }
+                addPattern(outputPatternMap, outId, property, finalDependency);
+            } else {
+                if (config.validate_callbacks) {
+                    let outIdName = combineIdAndProp(outIdProp);
                     // if this output is also an input, add `outputTag` to the name
                     if (alsoInput) {
-                        duplicateOutputs.push(tempOutIdProp);
+                        duplicateOutputs.push(outIdProp);
                         outIdName += outputTag;
                     }
-                    addOutputToMulti(id, outIdName);
-                });
-                addPattern(outputPatterns, outId, property, finalDependency);
-            } else {
-                let outIdName = combineIdAndProp(outIdProp);
-                // if this output is also an input, add `outputTag` to the name
-                if (alsoInput) {
-                    duplicateOutputs.push(outIdProp);
-                    outIdName += outputTag;
+                    addOutputToMulti({}, outIdName);
                 }
-                addOutputToMulti({}, outIdName);
                 addMap(outputMap, outId, property, finalDependency);
             }
         });
@@ -871,12 +947,14 @@ export function computeGraphs(dependencies, dispatchError) {
         inputs.forEach(inputObject => {
             const {id: inId, property: inProp} = inputObject;
             if (typeof inId === 'object') {
-                addPattern(inputPatterns, inId, inProp, finalDependency);
+                addPattern(inputPatternMap, inId, inProp, finalDependency);
             } else {
                 addMap(inputMap, inId, inProp, finalDependency);
             }
         });
     });
+    outputPatterns = offloadPatterns(outputPatternMap, outputPatterns);
+    inputPatterns = offloadPatterns(inputPatternMap, inputPatterns);
 
     // second pass for adding new output nodes as dependencies where needed
     duplicateOutputs.forEach(dupeOutIdProp => {
@@ -896,6 +974,11 @@ export function computeGraphs(dependencies, dispatchError) {
             }
         }
     });
+    const end = performance.now();
+    if (!window.dash_component_api) {
+        window.dash_component_api = {};
+    }
+    window.dash_component_api.callbackGraphTime = (end - start).toFixed(2);
 
     return finalGraphs;
 }
@@ -977,7 +1060,7 @@ export function idMatch(
     return true;
 }
 
-function getAnyVals(patternVals, vals) {
+export function getAnyVals(patternVals, vals) {
     const matches = [];
     for (let i = 0; i < patternVals.length; i++) {
         if (patternVals[i] === MATCH) {
@@ -1076,7 +1159,12 @@ function addResolvedFromOutputs(callback, outPattern, outs, matches) {
     });
 }
 
-export function addAllResolvedFromOutputs(resolve, paths, matches) {
+export function addAllResolvedFromOutputs(
+    resolve,
+    paths,
+    matches,
+    triggerAnyVals = ''
+) {
     return callback => {
         const {matchKeys, firstSingleOutput, outputs} = callback;
         if (matchKeys.length) {
@@ -1113,7 +1201,11 @@ export function addAllResolvedFromOutputs(resolve, paths, matches) {
                 });
             }
         } else {
-            const cb = makeResolvedCallback(callback, resolve, '');
+            // Outputs have no MATCH keys (fixed-id outputs or no output).
+            // Fall back to the triggering input's MATCH values so that
+            // separate MATCH triggers produce distinct resolvedIds and
+            // aren't deduplicated into a single firing. See issue #2462.
+            const cb = makeResolvedCallback(callback, resolve, triggerAnyVals);
             matches.push(cb);
         }
     };
@@ -1171,13 +1263,26 @@ export function getWatchedKeys(id, newProps, graphs) {
  * opts.chunkPath: path to the new chunk - used to determine if any outputs are
  *   outside of this chunk, because this determines whether inputs inside the
  *   chunk count as having changed
+ * opts.patchAnalysis: what the `Patch()` operations that produced this chunk
+ *   changed. Only the components the patch created get their initial call
+ *   It also allows an input the patch wrote directly to bypass the chunkPath
+ *   dedup, when that input's own component was carried over (so
+ *   its own initial call stays suppressed) but downstream callbacks still
+ *   need to see the new value
+ *   Absent when the chunk is not the result of a patch
  *
  * Returns an array of objects:
  *   {callback, resolvedId, getOutputs, getInputs, getState, ...etc}
  *   See getCallbackByOutput for details.
  */
 export function getUnfilteredLayoutCallbacks(graphs, paths, layoutChunk, opts) {
-    const {outputsOnly, removedArrayInputsOnly, newPaths, chunkPath} = opts;
+    const {
+        outputsOnly,
+        removedArrayInputsOnly,
+        newPaths,
+        chunkPath,
+        patchAnalysis
+    } = opts;
     const foundCbIds = {};
     const callbacks = [];
 
@@ -1225,6 +1330,18 @@ export function getUnfilteredLayoutCallbacks(graphs, paths, layoutChunk, opts) {
 
     function handleOneId(id, outIdCallbacks, inIdCallbacks) {
         if (outIdCallbacks) {
+            // Suppress the initial call for components a Patch carried over
+            // The patch itself tells us which components it created, including
+            // components rebuilt with an id that was already in use,
+            // whose initial callbacks must run again even if their new defaults
+            // happen to match the values of the instance they replaced.
+            // It excludes the containers between the patched prop and the value
+            // that changed: ramda's assocPath has to rebuild those, but the
+            // patch did not create them, so they keep their initial call
+            // suppressed
+            const isCarryOver = patchAnalysis
+                ? isCarriedOverByPatch(patchAnalysis, stringifyId(id))
+                : false;
             for (const property in outIdCallbacks) {
                 const cb = getCallbackByOutput(graphs, paths, id, property);
                 if (cb) {
@@ -1232,7 +1349,7 @@ export function getUnfilteredLayoutCallbacks(graphs, paths, layoutChunk, opts) {
                     // unless specifically requested not to.
                     // ie this is the initial call of this callback even if it's
                     // not the page initialization but just a new layout chunk
-                    if (!cb.callback.prevent_initial_call) {
+                    if (!cb.callback.prevent_initial_call && !isCarryOver) {
                         cb.initialCall = true;
                         addCallback(cb);
                     }
@@ -1240,23 +1357,36 @@ export function getUnfilteredLayoutCallbacks(graphs, paths, layoutChunk, opts) {
             }
         }
         if (!outputsOnly && inIdCallbacks) {
+            const idStr = stringifyId(id);
             const maybeAddCallback = removedArrayInputsOnly
-                ? addCallbackIfArray(stringifyId(id))
+                ? addCallbackIfArray(idStr)
                 : addCallback;
-            let handleThisCallback = maybeAddCallback;
-            if (chunkPath) {
-                handleThisCallback = cb => {
-                    if (
-                        !all(
-                            startsWith(chunkPath),
-                            pluck('path', flatten(cb.getOutputs(paths)))
-                        )
-                    ) {
-                        maybeAddCallback(cb);
-                    }
-                };
-            }
             for (const property in inIdCallbacks) {
+                // A callback, whose outputs are all inside the chunk, is
+                // normally dropped here on the assumption that the
+                // output handling above already covers it
+                // That assumption fails when the patch
+                // wrote a new value directly on this input without
+                // recreating the input's own component
+                // The output side stays suppressed because the output
+                // component was carried over, but this input's value
+                // genuinely changed, so the callback must still be added
+                let handleThisCallback = maybeAddCallback;
+                if (
+                    chunkPath &&
+                    !wasWrittenByPatch(patchAnalysis, idStr, property)
+                ) {
+                    handleThisCallback = cb => {
+                        if (
+                            !all(
+                                startsWith(chunkPath),
+                                pluck('path', flatten(cb.getOutputs(paths)))
+                            )
+                        ) {
+                            maybeAddCallback(cb);
+                        }
+                    };
+                }
                 getCallbacksByInput(
                     graphs,
                     paths,

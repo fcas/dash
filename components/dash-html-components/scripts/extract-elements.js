@@ -2,7 +2,6 @@
 
 const fs = require('fs');
 const cheerio = require('cheerio');
-const request = require('request');
 
 const refUrl = 'https://developer.mozilla.org/en-US/docs/Web/HTML/Element';
 const dataPath = './data/elements.txt';
@@ -21,7 +20,14 @@ function extractElements($) {
         'image', 'dir', 'tt', 'applet', 'noembed', 'bgsound', 'menu', 'menuitem',
         'noframes',
         // experimental, don't add yet
-        'portal'
+        'portal',
+        'fencedframe',
+        'selectedcontent',
+        // not a real HTML element (Geolocation API). MDN lists it with an
+        // "Experimental" badge, so it only stays excluded if the badge text is
+        // stripped from the cell first (see the first-line/trim normalization
+        // in the map below).
+        'geolocation',
     ];
     // `<section>` is for some reason missing from the reference tables.
     const addElements = [
@@ -44,7 +50,11 @@ function extractElements($) {
     return $('td:first-child')
         .toArray()
         .map(el => {
-            return cheerio(el).text().replace(/[<>]/g, '')
+            // Cell text can include an "Experimental"/"Deprecated" badge on a
+            // following line (e.g. "geolocation \nExperimental\n"). Keep only the
+            // element name from the first line and trim surrounding whitespace so
+            // the exclusions above match regardless of badge formatting.
+            return cheerio(el).text().replace(/[<>]/g, '').split('\n')[0].trim();
         })
         .reduce((list, element) => {
             const subList = element.split(', ');
@@ -61,14 +71,21 @@ function extractElements($) {
         }, []);
 }
 
-request(refUrl, (error, response, html) => {
-    if (error) {
+fetch(refUrl)
+    .then(response => {
+        if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        return response.text();
+    })
+    .then(html => {
+        const $ = cheerio.load(html);
+        const elements = extractElements($);
+        const out = elements.join('\n');
+
+        fs.writeFileSync(dataPath, out);
+    })
+    .catch(error => {
         console.error(error);
         process.exit(-1);
-    }
-    const $ = cheerio.load(html);
-    const elements = extractElements($);
-    const out = elements.join('\n');
-
-    fs.writeFileSync(dataPath, out);
-});
+    });
